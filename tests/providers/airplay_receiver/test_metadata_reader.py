@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import pathlib
@@ -133,3 +134,57 @@ async def test_reader_keeps_pipe_attached_across_restart(
         await _wait_for(lambda: updates[-1:] == [{"play_state": "stopped"}], timeout=5.0)
     finally:
         await reader.stop()
+
+
+def _xml_item(code: str, data: str | None = None) -> str:
+    """Build a metadata item as shairport-sync writes it to the pipe."""
+    payload = "" if data is None else base64.b64encode(data.encode()).decode()
+    item = (
+        f"<item><type>{b'ssnc'.hex()}</type><code>{code.encode().hex()}</code>"
+        f"<length>{len(data or '')}</length>"
+    )
+    if data is not None:
+        item += f'\n<data encoding="base64">\n{payload}</data>'
+    return item + "</item>"
+
+
+async def _parse(reader: MetadataReader, *items: str) -> None:
+    for item in items:
+        reader._parse_xml_item(item)
+    # each item is handled on its own task
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+async def test_dacp_identifiers_are_reported(pipe_path: str) -> None:
+    """The client's DACP id, Active-Remote token and address reach the provider at once."""
+    received: list[dict[str, Any]] = []
+    reader = MetadataReader(pipe_path, logging.getLogger(__name__), received.append)
+    await _parse(
+        reader,
+        _xml_item("daid", "A1B2C3D4E5F60718"),
+        _xml_item("acre", "1234567890"),
+        _xml_item("clip", "192.0.2.10"),
+    )
+    assert received == [
+        {"dacp_id": "A1B2C3D4E5F60718"},
+        {"active_remote": "1234567890"},
+        {"client_ip": "192.0.2.10"},
+    ]
+
+
+async def test_volume_report_carries_the_airplay_db_value(pipe_path: str) -> None:
+    """A pvol report keeps the raw AirPlay dB value next to the percentage."""
+    received: list[dict[str, Any]] = []
+    reader = MetadataReader(pipe_path, logging.getLogger(__name__), received.append)
+    await reader._process_metadata_item("ssnc", "pvol", "-15.00,-43.34,-96.30,0.00")
+    assert received == [{"volume": 50, "airplay_volume": -15.0}]
+
+
+async def test_resume_is_reported_at_once(pipe_path: str) -> None:
+    """A resume within the session is passed on right away, not batched until mden."""
+    received: list[dict[str, Any]] = []
+    reader = MetadataReader(pipe_path, logging.getLogger(__name__), received.append)
+    # a zero-length item: the path where the data-only parsing used to drop it
+    await _parse(reader, _xml_item("prsm"))
+    assert received == [{"resumed": True}]

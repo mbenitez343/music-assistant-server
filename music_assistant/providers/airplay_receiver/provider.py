@@ -46,6 +46,7 @@ from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.helpers.process import AsyncProcess, check_output
 from music_assistant.helpers.util import interface_name_for_ip
 from music_assistant.models.plugin import PluginProvider, SourceControlValue
+from music_assistant.providers.airplay_receiver.dacp import DacpRemote, DacpUnavailableError
 from music_assistant.providers.airplay_receiver.helpers import get_shairport_sync_binary
 from music_assistant.providers.airplay_receiver.metadata import MetadataReader
 
@@ -60,6 +61,14 @@ if TYPE_CHECKING:
     from music_assistant.models.player import Player
 
 SUPPORTED_FEATURES = {ProviderFeature.AUDIO_SOURCE}
+
+# MA source controls and the DACP commands the AirPlay client takes for them
+_DACP_COMMANDS = {
+    SourceControl.PLAY: "play",
+    SourceControl.PAUSE: "pause",
+    SourceControl.NEXT: "nextitem",
+    SourceControl.PREVIOUS: "previtem",
+}
 
 # seconds the silence nudge waits for the audio pipe's consumer to reattach
 AUDIO_PIPE_READER_TIMEOUT = 1.0
@@ -135,6 +144,13 @@ class _ReceiverDaemon:
     # the in-flight externally-triggered playback start (awaits the pending stop)
     pending_start_task: asyncio.Task[None] | None = None
     first_volume_event_received: bool = False  # Track if we've received the first volume event
+    # remote control of the AirPlay client streaming to this receiver
+    dacp: DacpRemote = field(default_factory=DacpRemote)
+    # the volume the client last reported, to tell its own changes from the player's
+    last_client_volume: int | None = None
+    # paused from Music Assistant over DACP: the client then ends its AirPlay session,
+    # which must not release the source (a later PLAY resumes it over DACP)
+    remote_paused: bool = False
 
     def cover_art_path(self, img_hash: str) -> str:
         """
@@ -292,12 +308,48 @@ class AirPlayReceiverProvider(PluginProvider):
         value: SourceControlValue = None,
     ) -> None:
         """
-        Handle source control commands (no-op: AirPlay receiver is passive).
+        Forward a playback control command to the AirPlay client over DACP.
 
-        The AudioSource advertises no control capabilities, so MA will not invoke
-        any actions here. Override exists only to satisfy the contract.
+        :param source_id: The AudioSource.item_id the command applies to.
+        :param action: The control action to perform.
+        :param value: Unused; AirPlay transport commands take no payload.
         """
-        del source_id, action
+        del value
+        command = _DACP_COMMANDS.get(action)
+        daemon = self._daemons.get(source_id)
+        if command is None or daemon is None:
+            return
+        try:
+            await daemon.dacp.send(
+                self.mass.discovery.aiozc.zeroconf, self.mass.http_session, command
+            )
+        except DacpUnavailableError as err:
+            raise UnsupportedFeaturedException(
+                f"The AirPlay client cannot be controlled remotely: {err}"
+            ) from err
+        if action == SourceControl.PAUSE:
+            await self._remote_pause(daemon)
+        elif action == SourceControl.PLAY:
+            self._remote_resume(daemon)
+
+    async def on_volume_change(self, source_id: str, volume: int) -> None:
+        """
+        Move the AirPlay client's volume slider to the player's new volume.
+
+        :param source_id: The AudioSource.item_id currently streaming.
+        :param volume: The new volume level (0-100).
+        """
+        daemon = self._daemons.get(source_id)
+        if daemon is None or not daemon.dacp.available:
+            return
+        # a change the client itself reported comes back here: do not send it back
+        if volume == daemon.last_client_volume:
+            return
+        # our own steps are not recorded as the client's, its next report will be
+        daemon.last_client_volume = None
+        # the walk takes a second or two and MA waits for this hook before it sets the
+        # player's own volume, so it runs in the background
+        self.mass.create_task(self._sync_client_volume(daemon, volume))
 
     async def on_source_selected(
         self,
@@ -345,6 +397,20 @@ class AirPlayReceiverProvider(PluginProvider):
         # Update the active player
         daemon.active_player_id = active_player_id
         self.logger.debug("Active player set to: %s", active_player_id)
+
+    async def on_source_released(self, source_id: str, player_id: str) -> None:
+        """
+        Forget a pause sent over DACP once the player lets go of the source.
+
+        :param source_id: The AudioSource.item_id that was released.
+        :param player_id: The player that let it go.
+        """
+        daemon = self._daemons.get(source_id)
+        if daemon is None or daemon.active_player_id != player_id:
+            return
+        daemon.remote_paused = False
+        if not daemon.in_use_by_player:
+            daemon.active_player_id = None
 
     async def on_source_unselected(
         self, source_id: str, owner_player_id: str, stream_session_id: str
@@ -466,9 +532,10 @@ class AirPlayReceiverProvider(PluginProvider):
                     audio_format=self._audio_format,
                 )
             },
-            can_play_pause=False,
+            # sent to the client as DACP commands (iOS, macOS and iTunes offer them)
+            can_play_pause=True,
             can_seek=False,
-            can_next_previous=False,
+            can_next_previous=True,
             exclusive=True,
             allow_external_trigger=True,
             # passive: only flows when an external AirPlay client is connected
@@ -772,6 +839,50 @@ class AirPlayReceiverProvider(PluginProvider):
             return
         await daemon.audio_pipe.write(silence)
 
+    async def _sync_client_volume(self, daemon: _ReceiverDaemon, volume: int) -> None:
+        """
+        Move the AirPlay client's volume to the given level, logging when it cannot.
+
+        :param daemon: The receiver daemon whose client to adjust.
+        :param volume: The target volume level (0-100).
+        """
+        try:
+            await daemon.dacp.set_volume(
+                self.mass.discovery.aiozc.zeroconf, self.mass.http_session, volume
+            )
+        except DacpUnavailableError as err:
+            self.logger.debug("Could not sync the AirPlay client volume: %s", err)
+
+    async def _remote_pause(self, daemon: _ReceiverDaemon) -> None:
+        """
+        Stop the player after its client was paused, keeping the source on it.
+
+        :param daemon: The receiver daemon whose client was paused.
+        """
+        # otherwise the player keeps showing as playing and a toggle pauses again.
+        # Stopping it (as AriaCast does) keeps the source, so PLAY still reaches us
+        daemon.remote_paused = True
+        player_id = daemon.in_use_by_player or daemon.active_player_id
+        daemon.in_use_by_player = None
+        daemon.active_session_id = None
+        if player_id:
+            await self.mass.players.cmd_stop(player_id)
+
+    def _remote_resume(self, daemon: _ReceiverDaemon) -> None:
+        """
+        Restart playback on the player after the client was resumed over DACP.
+
+        :param daemon: The receiver daemon whose client was resumed.
+        """
+        daemon.remote_paused = False
+        if daemon.in_use_by_player or not daemon.active_player_id:
+            return
+        if daemon.pending_start_task and not daemon.pending_start_task.done():
+            return
+        daemon.pending_start_task = self.mass.create_task(
+            self._start_playback(daemon, daemon.active_player_id)
+        )
+
     def _clear_active_player(self, daemon: _ReceiverDaemon) -> None:
         """
         Clear a receiver's active player.
@@ -824,9 +935,29 @@ class AirPlayReceiverProvider(PluginProvider):
         if "metadata_start" in metadata:
             return
 
+        # The client's DACP remote (sent as separate items, not with mden)
+        if {"dacp_id", "active_remote", "client_ip"} & metadata.keys():
+            daemon.dacp.update(
+                dacp_id=metadata.get("dacp_id"),
+                active_remote=metadata.get("active_remote"),
+                client_ip=metadata.get("client_ip"),
+            )
+            return
+
+        # Resumed on the client itself within a session we paused: nothing else tells
+        # us, and the player we stopped would stay silent
+        if metadata.get("resumed"):
+            if daemon.remote_paused:
+                self._remote_resume(daemon)
+            return
+
         # Handle volume changes from AirPlay client
+        if "airplay_volume" in metadata:
+            daemon.dacp.airplay_volume = metadata["airplay_volume"]
         if "volume" in metadata and daemon.in_use_by_player:
-            self._handle_volume_change(daemon, metadata["volume"])
+            # the steps of our own volume walk are echoed back: not a user change
+            if not daemon.dacp.volume_echo:
+                self._handle_volume_change(daemon, metadata["volume"])
 
         # Update source metadata fields
         self._update_source_metadata(daemon, metadata)
@@ -851,6 +982,7 @@ class AirPlayReceiverProvider(PluginProvider):
         :param play_state: The new play state ("playing" or "stopped").
         """
         if play_state == "playing":
+            daemon.remote_paused = False
             # Reset volume event flag for new playback session
             daemon.first_volume_event_received = False
             # Initiate playback via the standard play_media flow on the target player
@@ -866,8 +998,21 @@ class AirPlayReceiverProvider(PluginProvider):
                 daemon.pending_start_task = self.mass.create_task(
                     self._start_playback(daemon, target_player_id)
                 )
+        elif play_state == "stopped" and daemon.remote_paused:
+            # the client ends its session when we pause it: stop the player but keep
+            # the source on it, so PLAY reaches us and resumes the client over DACP
+            self.logger.info("AirPlay client paused from Music Assistant")
+            current_player_id = daemon.in_use_by_player
+            daemon.in_use_by_player = None
+            daemon.active_session_id = None
+            self.mass.create_task(self._write_silence_to_unblock_stream(daemon))
+            if current_player_id:
+                daemon.pending_stop_task = self.mass.create_task(
+                    self.mass.players.cmd_stop(current_player_id)
+                )
         elif play_state == "stopped":
             self.logger.info("AirPlay playback stopped")
+            daemon.dacp.clear()
             # Reset volume event flag for next session
             daemon.first_volume_event_received = False
             # Get the current player before clearing
@@ -911,6 +1056,7 @@ class AirPlayReceiverProvider(PluginProvider):
         :param daemon: The receiver daemon the volume change originates from.
         :param volume: The new volume level (0-100).
         """
+        daemon.last_client_volume = volume
         # Skip the first volume event as it's the initial sync from default_airplay_volume
         # We don't want to override the player's current volume on startup
         if not daemon.first_volume_event_received:
