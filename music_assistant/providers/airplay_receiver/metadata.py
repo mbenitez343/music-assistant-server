@@ -286,6 +286,13 @@ class MetadataReader:
                 self.on_metadata({"metadata_start": True})
             return
 
+        # A resume within the session carries no data and has no session event of its
+        # own, so it is passed on here, before the data-only parsing below
+        if item_type == "ssnc" and code == "prsm":
+            if self.on_metadata:
+                self.on_metadata({"resumed": True})
+            return
+
         if item_type == "ssnc" and code == "mden":
             if self.on_metadata and self._current_metadata:
                 self.on_metadata(dict(self._current_metadata))
@@ -362,12 +369,21 @@ class MetadataReader:
             self._parse_volume(data)
             # Send volume updates immediately (not batched with mden)
             if self.on_metadata and "volume" in self._current_metadata:
-                self.on_metadata({"volume": self._current_metadata["volume"]})
+                self.on_metadata(
+                    {
+                        "volume": self._current_metadata["volume"],
+                        "airplay_volume": self._current_metadata["airplay_volume"],
+                    }
+                )
         elif code == "prgr":  # Progress
             self._parse_progress(data)
             # Send progress updates immediately (not batched with mden)
             if self.on_metadata and "elapsed_time" in self._current_metadata:
                 self.on_metadata({"elapsed_time": self._current_metadata["elapsed_time"]})
+        elif code in ("daid", "acre", "clip") and self.on_metadata:
+            # the client's DACP id, Active-Remote token and address, for remote control
+            key = {"daid": "dacp_id", "acre": "active_remote", "clip": "client_ip"}[code]
+            self.on_metadata({key: data})
         elif code == "paus":  # Paused
             self._current_metadata["paused"] = True
         elif code == "prsm":  # Playing/resumed
@@ -387,6 +403,7 @@ class MetadataReader:
             parts = data.split(",")
             if len(parts) >= 1:
                 airplay_volume = float(parts[0])
+                self._current_metadata["airplay_volume"] = airplay_volume
                 # -144.0 means muted
                 if airplay_volume <= -144.0:
                     volume_percent = 0
